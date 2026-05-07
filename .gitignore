@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Inno Setup
+installer/Output/
+
+# IDE
+.vscode/
+.idea/
+
+# Local config / secrets
+*.local.json
+host_cert.pem
+host_key.pem
+client_pinned_certs.json
+remotecontrol_config.json
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
