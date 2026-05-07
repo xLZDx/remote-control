@@ -37,3 +37,5 @@ Desktop.ini
 *.log
 logs/
 *.zip
+dist_*/
+build_*/
