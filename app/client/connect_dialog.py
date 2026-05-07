@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
@@ -38,6 +38,7 @@ class ConnectInputs:
 
 class ConnectDialog(QDialog):
     NEW_LABEL = "(new connection)"
+    _public_ip_resolved = pyqtSignal(str)
 
     def __init__(self, client_cfg: config.ClientConfig) -> None:
         super().__init__()
@@ -157,7 +158,8 @@ class ConnectDialog(QDialog):
         outer.addWidget(buttons)
 
         self._refresh_local_ips()
-        public_ipv4_async(self._on_public_ip_resolved)
+        self._public_ip_resolved.connect(self._apply_public_ip)
+        public_ipv4_async(lambda ip: self._public_ip_resolved.emit(ip or ""))
 
         if not self.address_edit.text() and not self.hub_address_edit.text():
             self.address_edit.setFocus()
@@ -247,21 +249,24 @@ class ConnectDialog(QDialog):
             ips = []
         port = config.DEFAULT_PORT
         if ips:
-            text = "Local network: " + ",  ".join(f"{ip}:{port}" for ip in ips)
+            primary = ips[0]
+            others = ips[1:]
+            text = f"<b>Primary:</b> {primary}:{port}"
+            if others:
+                text += "    <i>Other:</i> " + ",  ".join(f"{ip}:{port}" for ip in others)
         else:
             text = "Local network: (could not detect interfaces)"
         self._my_local_label.setText(text)
 
-    def _on_public_ip_resolved(self, ip: str | None) -> None:
-        def _set_text() -> None:
-            port = config.DEFAULT_PORT
-            if ip:
-                self._my_public_label.setText(
-                    f"Internet IP: <b>{ip}:{port}</b>  (requires router port-forward for direct connects)"
-                )
-            else:
-                self._my_public_label.setText("Internet IP: not detected (offline?)")
-        QTimer.singleShot(0, _set_text)
+    @pyqtSlot(str)
+    def _apply_public_ip(self, ip: str) -> None:
+        port = config.DEFAULT_PORT
+        if ip:
+            self._my_public_label.setText(
+                f"Internet IP: <b>{ip}:{port}</b>  (requires router port-forward for direct connects)"
+            )
+        else:
+            self._my_public_label.setText("Internet IP: not detected (offline?)")
 
     def _show_internet_help(self) -> None:
         QMessageBox.information(

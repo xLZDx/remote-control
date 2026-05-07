@@ -23,11 +23,14 @@ class HostPinWindow(QWidget):
         toggle_view_only_requested(session_id, view_only)
         kick_session_requested(session_id)
         quit_requested
+        _public_ip_resolved(str): cross-thread - emitted from bg thread,
+                                  delivered on Qt thread (auto-queued)
     """
     regenerate_pin_requested = pyqtSignal()
     toggle_view_only_requested = pyqtSignal(str, bool)
     kick_session_requested = pyqtSignal(str)
     quit_requested = pyqtSignal()
+    _public_ip_resolved = pyqtSignal(str)   # empty string == "not detected"
 
     def __init__(
         self,
@@ -72,9 +75,12 @@ class HostPinWindow(QWidget):
         copy_pub = QPushButton("Copy")
         copy_pub.clicked.connect(self._copy_public)
         wan_grid.addWidget(copy_pub, 0, 2)
+        refresh_pub = QPushButton("Refresh")
+        refresh_pub.clicked.connect(self._refresh_public_ip)
+        wan_grid.addWidget(refresh_pub, 0, 3)
         help_btn = QPushButton("How to set up?")
         help_btn.clicked.connect(self._show_internet_help)
-        wan_grid.addWidget(help_btn, 0, 3)
+        wan_grid.addWidget(help_btn, 0, 4)
         wan_hint = QLabel(
             "<i>For PCs on a different network, the host PC's router must "
             "forward TCP/{port} to this PC.</i>"
@@ -130,8 +136,9 @@ class HostPinWindow(QWidget):
         self._timer.start(500)
         self.refresh()
 
-        # Public IP fetched once at startup, async
-        public_ipv4_async(self._on_public_ip_resolved)
+        # Cross-thread bridge: public IP worker -> Qt slot
+        self._public_ip_resolved.connect(self._apply_public_ip)
+        self._refresh_public_ip()
 
     # ---------- public ----------
 
@@ -142,9 +149,16 @@ class HostPinWindow(QWidget):
             ips = local_ipv4_addresses(include_link_local=False)
         except Exception:
             ips = []
-        self.local_label.setText(
-            ",  ".join(f"{ip}:{port}" for ip in ips) if ips else "(no LAN interfaces detected)"
-        )
+        if ips:
+            # First IP is the route-out (primary). Mark it.
+            primary = ips[0]
+            others = ips[1:]
+            text = f"<b>Primary:</b> {primary}:{port}"
+            if others:
+                text += "    <i>Other interfaces:</i> " + ",  ".join(f"{ip}:{port}" for ip in others)
+            self.local_label.setText(text)
+        else:
+            self.local_label.setText("(no LAN interfaces detected)")
         if self._public_ip:
             self.public_label.setText(f"<b>{self._public_ip}:{port}</b>")
         # update placeholder hint with current port
@@ -172,15 +186,21 @@ class HostPinWindow(QWidget):
 
     # ---------- helpers ----------
 
-    def _on_public_ip_resolved(self, ip: str | None) -> None:
-        def _set() -> None:
+    def _refresh_public_ip(self) -> None:
+        """Trigger a background public-IP lookup; result delivered via Qt signal."""
+        self.public_label.setText("Detecting...")
+        public_ipv4_async(lambda ip: self._public_ip_resolved.emit(ip or ""))
+
+    @pyqtSlot(str)
+    def _apply_public_ip(self, ip: str) -> None:
+        """Runs on the Qt main thread (queued from _public_ip_resolved signal)."""
+        if ip:
             self._public_ip = ip
-            if ip:
-                port = self.get_port()
-                self.public_label.setText(f"<b>{ip}:{port}</b>")
-            else:
-                self.public_label.setText("Not detected (offline?)")
-        QTimer.singleShot(0, _set)
+            port = self.get_port()
+            self.public_label.setText(f"<b>{ip}:{port}</b>")
+        else:
+            self._public_ip = None
+            self.public_label.setText("Not detected (click Refresh, or check internet)")
 
     def _copy_pin(self) -> None:
         QApplication.clipboard().setText(self.get_pin(), QClipboard.Mode.Clipboard)

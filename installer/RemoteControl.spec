@@ -33,6 +33,7 @@ a = Analysis(
         "cryptography", "cryptography.hazmat",
         "dxcam",
         "numpy",
+        "cv2",                                  # required by dxcam BGR color converter
     ],
     hookspath=[],
     hooksconfig={},

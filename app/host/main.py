@@ -118,6 +118,7 @@ class HostApp(QObject):
         self.tray.regenerate_pin_requested.connect(self.regenerate_pin)
         self.tray.quit_requested.connect(self.quit)
         self.tray.hub_settings_requested.connect(self._show_hub_settings)
+        self.tray.open_log_requested.connect(self._open_log_folder)
         self.tray.show()
         self._hub_dialog: HubSettingsDialog | None = None
 
@@ -342,6 +343,18 @@ class HostApp(QObject):
         self.window.show()
         self.window.raise_()
         self.window.activateWindow()
+
+    def _open_log_folder(self) -> None:
+        import os
+        import subprocess
+        path = str(config.appdata_dir())
+        try:
+            os.startfile(path)  # type: ignore[attr-defined]
+        except Exception:
+            try:
+                subprocess.Popen(["explorer", path])
+            except Exception:
+                logger.exception("could not open log folder")
 
     def _status_text(self) -> str:
         if self.server is None:

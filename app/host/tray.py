@@ -31,6 +31,7 @@ class HostTray(QSystemTrayIcon):
     show_window_requested = pyqtSignal()
     regenerate_pin_requested = pyqtSignal()
     hub_settings_requested = pyqtSignal()
+    open_log_requested = pyqtSignal()
     quit_requested = pyqtSignal()
 
     def __init__(self, get_status_text: Callable[[], str]) -> None:
@@ -49,6 +50,12 @@ class HostTray(QSystemTrayIcon):
         hub_action = QAction("Hub Settings...", menu)
         hub_action.triggered.connect(self.hub_settings_requested)
         menu.addAction(hub_action)
+
+        menu.addSeparator()
+
+        log_action = QAction("Open log folder", menu)
+        log_action.triggered.connect(self.open_log_requested)
+        menu.addAction(log_action)
 
         menu.addSeparator()
 

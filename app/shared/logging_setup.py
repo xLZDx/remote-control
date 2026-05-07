@@ -22,14 +22,18 @@ _log_lock = threading.Lock()
 
 
 def init_logging(level: int = logging.INFO) -> Path:
-    """Idempotent logging setup. Returns the path of the active log file."""
+    """Idempotent logging setup. Returns the path of the active log file.
+
+    If the root logger already has handlers (likely because app/main.py's
+    bootstrap ran first), this is a no-op and we just return the path."""
     global _log_initialized
     with _log_lock:
         log_path = config.appdata_dir() / "app.log"
-        if _log_initialized:
+        root = logging.getLogger()
+        if _log_initialized or root.handlers:
+            _log_initialized = True
             return log_path
 
-        root = logging.getLogger()
         root.setLevel(level)
 
         # File handler (rotating)

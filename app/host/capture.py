@@ -164,9 +164,9 @@ class ScreenCapture:
             logger.error("dxcam not available; capture thread exiting")
             return
         try:
-            self._cam = dxcam.create(output_idx=self.monitor_index, output_color="BGR")
+            self._cam = self._create_camera_with_fallback()
             if self._cam is None:
-                logger.error("dxcam.create returned None for monitor %d", self.monitor_index)
+                logger.error("dxcam.create failed for all GPUs / outputs")
                 return
             self._cam.start(target_fps=self.target_fps, video_mode=True)
             interval = 1.0 / max(self.target_fps, 1)
@@ -201,6 +201,46 @@ class ScreenCapture:
             except Exception:
                 pass
             self._cam = None
+
+    def _create_camera_with_fallback(self):
+        """Try (device_idx, output_idx) combinations until one succeeds.
+
+        On laptops with hybrid graphics (NVIDIA Optimus / AMD Switchable),
+        the primary display might be attached to a different DXGI adapter
+        than dxcam's default. We brute-force a small grid.
+        """
+        # First the user-requested output on the default device (matches old behavior)
+        attempts = [(None, self.monitor_index)]
+        # Then enumerate small grid
+        for d in range(0, 4):
+            for o in range(0, 4):
+                if (d, o) not in attempts and (None, o) not in attempts:
+                    attempts.append((d, o))
+
+        last_exc: Exception | None = None
+        for device_idx, output_idx in attempts:
+            try:
+                if device_idx is None:
+                    cam = dxcam.create(output_idx=output_idx, output_color="BGR")
+                else:
+                    cam = dxcam.create(device_idx=device_idx, output_idx=output_idx, output_color="BGR")
+                if cam is not None:
+                    if device_idx is not None or output_idx != self.monitor_index:
+                        logger.warning(
+                            "dxcam fell back to device_idx=%s output_idx=%d "
+                            "(requested output_idx=%d)",
+                            device_idx, output_idx, self.monitor_index,
+                        )
+                    self.monitor_index = output_idx
+                    return cam
+            except Exception as exc:
+                last_exc = exc
+                logger.debug("dxcam.create(device_idx=%s, output_idx=%d) failed: %s",
+                             device_idx, output_idx, exc)
+                continue
+        if last_exc is not None:
+            logger.error("dxcam.create exhausted all attempts; last error: %s", last_exc)
+        return None
 
     def _enqueue(self, frame: Optional[Frame]) -> None:
         # Drop oldest if queue full (latency over completeness)

@@ -3,6 +3,7 @@
 # Python 3.13 / 3.14 wheels. PyInstaller will lock against whatever
 # is in the build venv.
 dxcam>=0.0.5
+opencv-python-headless>=4.10    # required by dxcam BGR color conversion
 av>=13
 PyQt6>=6.7
 pystray>=0.19
