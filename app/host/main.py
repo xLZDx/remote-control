@@ -27,6 +27,7 @@ from app.host.server import HostServer, ClientSession
 from app.host.tray import HostTray
 from app.host.ui_pin import HostPinWindow
 from app.shared import config, crypto, protocol
+from app.shared.logging_setup import init_logging
 from app.shared.protocol import Message, MessageType
 
 logger = logging.getLogger(__name__)
@@ -121,10 +122,21 @@ class HostApp(QObject):
         # Boot async parts
         fut = self.worker.run_coro(self._async_start())
         try:
-            fut.result(timeout=15)
+            fut.result(timeout=20)
         except Exception as exc:
             logger.exception("startup failed")
-            QMessageBox.critical(None, "RemoteControl", f"Startup failed: {exc}")
+            log_path = config.appdata_dir() / "app.log"
+            QMessageBox.critical(
+                None, "RemoteControl - startup failed",
+                f"{exc.__class__.__name__}: {exc}\n\n"
+                f"Common causes:\n"
+                f"  - port {self.cfg.host.port} already in use (close other RemoteControl, "
+                f"    change port in config.json)\n"
+                f"  - dxcam couldn't initialize (multi-GPU laptop? try right-clicking the "
+                f"    RemoteControl shortcut -> Run with graphics processor -> Integrated)\n"
+                f"  - PyAV/FFmpeg DLLs not loaded (rebuild from source)\n\n"
+                f"Full traceback in:\n  {log_path}",
+            )
             self.qt_app.quit()
             return
 
@@ -133,27 +145,62 @@ class HostApp(QObject):
     # ---------- async setup ----------
 
     async def _async_start(self) -> None:
+        logger.info("host startup: cert + capture + encoder + server")
+
         # cert
-        cert_path, _ = crypto.ensure_host_cert()
         try:
+            cert_path, _ = crypto.ensure_host_cert()
             self._fingerprint = crypto.cert_fingerprint(cert_path.read_bytes())
-        except Exception:
-            self._fingerprint = ""
+            logger.info("cert fingerprint: %s", self._fingerprint)
+        except Exception as exc:
+            logger.exception("cert generation failed")
+            raise RuntimeError(f"could not generate TLS certificate: {exc}") from exc
 
         # capture
-        self.capture = ScreenCapture(
-            target_fps=self.cfg.host.fps,
-            monitor_index=0,
-        )
-        await self.capture.start()
-        mon = self.capture.monitors[0]
-        # encoder for primary monitor
-        self.encoder = H264Encoder(
-            width=max(mon.width, 1280),
-            height=max(mon.height, 720),
-            fps=self.cfg.host.fps,
-            bitrate_kbps=self.cfg.host.bitrate_kbps,
-        )
+        try:
+            self.capture = ScreenCapture(
+                target_fps=self.cfg.host.fps,
+                monitor_index=0,
+            )
+            await self.capture.start()
+        except Exception as exc:
+            logger.exception("capture init failed")
+            raise RuntimeError(
+                f"screen capture failed to initialize: {exc}\n\n"
+                f"This usually means dxcam can't access the display adapter. "
+                f"On laptops with switchable graphics (NVIDIA Optimus / AMD Switchable), "
+                f"try Settings -> System -> Display -> Graphics, find RemoteControl, "
+                f"and set it to use the integrated GPU."
+            ) from exc
+
+        mons = self.capture.monitors
+        if not mons:
+            raise RuntimeError("no monitors detected by dxcam")
+        mon = mons[0]
+        if mon.width <= 0 or mon.height <= 0:
+            logger.warning("monitor reports 0x0 - using 1920x1080 fallback")
+            cap_w, cap_h = 1920, 1080
+        else:
+            cap_w, cap_h = mon.width, mon.height
+        # H.264 requires even dimensions
+        cap_w -= cap_w % 2
+        cap_h -= cap_h % 2
+        logger.info("capture monitor: %s %dx%d", mon.name, cap_w, cap_h)
+
+        try:
+            self.encoder = H264Encoder(
+                width=cap_w,
+                height=cap_h,
+                fps=self.cfg.host.fps,
+                bitrate_kbps=self.cfg.host.bitrate_kbps,
+            )
+        except Exception as exc:
+            logger.exception("encoder init failed")
+            raise RuntimeError(
+                f"H.264 encoder failed to initialize: {exc}\n\n"
+                f"This usually means FFmpeg DLLs (libx264) aren't loadable. "
+                f"Try reinstalling RemoteControl."
+            ) from exc
         self.broadcaster = FrameBroadcaster(self.encoder)
 
         # server
@@ -167,11 +214,20 @@ class HostApp(QObject):
         self.server.on_client_disconnect = self._on_client_disconnect
         self.server.on_input_event = self._on_input_event
 
-        await self.server.start()
+        try:
+            await self.server.start()
+        except OSError as exc:
+            logger.exception("server bind failed")
+            raise RuntimeError(
+                f"could not listen on port {self.cfg.host.port}: {exc}\n\n"
+                f"Likely the port is already in use by another process."
+            ) from exc
         asyncio.create_task(self.server.serve_forever())
+        logger.info("server listening on %s:%d", self.cfg.host.bind_address, self.cfg.host.port)
 
         # capture pump
         self._capture_task = asyncio.create_task(self._pump_capture())
+        logger.info("host startup complete")
 
     async def _pump_capture(self) -> None:
         if self.capture is None or self.broadcaster is None:
@@ -286,8 +342,9 @@ class HostApp(QObject):
 
 
 def run() -> int:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname).1s] %(name)s: %(message)s")
+    log_path = init_logging()
+    logger.info("=== RemoteControl host starting ===")
+    logger.info("log: %s", log_path)
     qt = QApplication.instance() or QApplication(sys.argv)
     qt.setQuitOnLastWindowClosed(False)   # tray keeps app alive
     cfg = config.load()

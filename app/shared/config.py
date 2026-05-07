@@ -48,10 +48,61 @@ class HostConfig:
 
 
 @dataclass
+class SavedConnection:
+    name: str
+    address: str
+    port: int = DEFAULT_PORT
+
+
+@dataclass
 class ClientConfig:
     last_address: str = ""
     last_port: int = DEFAULT_PORT
     pinned_fingerprints: dict[str, str] = field(default_factory=dict)
+    saved_connections: list[dict] = field(default_factory=list)
+
+    def get_saved(self) -> list[SavedConnection]:
+        out: list[SavedConnection] = []
+        for entry in self.saved_connections:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                out.append(SavedConnection(
+                    name=str(entry.get("name", "")),
+                    address=str(entry.get("address", "")),
+                    port=int(entry.get("port", DEFAULT_PORT)),
+                ))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def upsert_saved(self, conn: SavedConnection) -> None:
+        """Add or update a saved connection by name (case-insensitive)."""
+        if not conn.name or not conn.address:
+            return
+        key = conn.name.strip().lower()
+        new_list: list[dict] = []
+        replaced = False
+        for entry in self.saved_connections:
+            if str(entry.get("name", "")).strip().lower() == key:
+                new_list.append({"name": conn.name, "address": conn.address, "port": int(conn.port)})
+                replaced = True
+            else:
+                new_list.append(entry)
+        if not replaced:
+            new_list.append({"name": conn.name, "address": conn.address, "port": int(conn.port)})
+        self.saved_connections = new_list
+
+    def remove_saved(self, name: str) -> bool:
+        if not name:
+            return False
+        key = name.strip().lower()
+        before = len(self.saved_connections)
+        self.saved_connections = [
+            e for e in self.saved_connections
+            if str(e.get("name", "")).strip().lower() != key
+        ]
+        return len(self.saved_connections) != before
 
 
 @dataclass

@@ -21,6 +21,8 @@ from app.client.decoder import H264Decoder
 from app.client.tcp_client import HostClient, AuthError, FingerprintMismatchError
 from app.client.viewer_window import ViewerWindow
 from app.shared import config, protocol
+from app.shared.config import SavedConnection
+from app.shared.logging_setup import humanize_socket_error, init_logging
 from app.shared.protocol import Message, MessageType
 
 logger = logging.getLogger(__name__)
@@ -86,17 +88,18 @@ class ClientApp(QObject):
         self.auto_disconnect.connect(self._on_auto_disconnect)
 
     def run(self) -> int:
-        # 1. Connect dialog
-        defaults = ConnectInputs(
-            address=self.cfg.client.last_address,
-            port=self.cfg.client.last_port,
-            pin="",
-        )
-        dlg = ConnectDialog(defaults)
+        # 1. Connect dialog (loop on retryable failures)
+        last_inputs: ConnectInputs | None = None
         while True:
+            dlg = ConnectDialog(self.cfg.client)
+            if last_inputs is not None:
+                dlg.address_edit.setText(last_inputs.address)
+                dlg.port_spin.setValue(last_inputs.port)
+                dlg.pin_edit.setFocus()
             if dlg.exec() != dlg.DialogCode.Accepted:
                 return 0
             inputs = dlg.values()
+            last_inputs = inputs
             if not inputs.address or not inputs.pin:
                 QMessageBox.warning(None, "RemoteControl", "Address and PIN are required.")
                 continue
@@ -104,9 +107,15 @@ class ClientApp(QObject):
             if ok:
                 break
 
-        # remember
+        # remember (last + saved)
         self.cfg.client.last_address = inputs.address
         self.cfg.client.last_port = inputs.port
+        if inputs.save_name:
+            self.cfg.client.upsert_saved(SavedConnection(
+                name=inputs.save_name,
+                address=inputs.address,
+                port=inputs.port,
+            ))
         try:
             config.save(self.cfg)
         except Exception:
@@ -137,7 +146,6 @@ class ClientApp(QObject):
         self.client.on_message = self._on_message  # noop until connected, but set early
 
         async def _confirm(host_key: str, fp: str) -> bool:
-            # We're in the asyncio thread; jump to Qt thread for the dialog
             future: asyncio.Future = asyncio.get_event_loop().create_future()
 
             def _ask() -> None:
@@ -150,32 +158,52 @@ class ClientApp(QObject):
             return await future
 
         async def _connect_async() -> Any:
-            return await self.client.connect(pin=inputs.pin, confirm_new_fingerprint=_confirm)
+            return await asyncio.wait_for(
+                self.client.connect(pin=inputs.pin, confirm_new_fingerprint=_confirm),
+                timeout=12.0,
+            )
 
+        logger.info("connect attempt: %s:%d", inputs.address, inputs.port)
         try:
             fut = self.worker.run_coro(_connect_async())
             fut.result(timeout=15)
+            logger.info("connect success: %s:%d", inputs.address, inputs.port)
             return True
+        except asyncio.TimeoutError:
+            self._show_error(
+                f"Timed out trying to reach {inputs.address}:{inputs.port} after 12 seconds.\n\n"
+                "Likely causes:\n"
+                "  - host PC is offline or has not started 'Share this PC'\n"
+                "  - if connecting from a different network, the host's router is not\n"
+                "    forwarding TCP/{port} to the host PC\n"
+                "  - Windows Firewall on the host is blocking inbound on the port"
+                .replace("{port}", str(inputs.port))
+            )
+            return False
         except FingerprintMismatchError as exc:
             self._show_error(
-                f"The host's certificate fingerprint changed.\n\n"
-                f"This could mean:\n"
-                f"  - the host re-installed RemoteControl\n"
-                f"  - someone is impersonating the host\n\n"
-                f"If you trust the new host, delete the saved fingerprint:\n"
+                "The host's certificate fingerprint changed.\n\n"
+                "This could mean:\n"
+                "  - the host re-installed RemoteControl\n"
+                "  - someone is impersonating the host\n\n"
+                "If you trust the new host, delete the saved fingerprint:\n"
                 f"  {config.PINNED_CERTS_PATH}\n"
                 f"and try again.\n\nDetails: {exc}"
             )
             return False
         except AuthError as exc:
-            self._show_error(f"Authentication failed: {exc}")
+            msg = str(exc) or "wrong PIN"
+            self._show_error(f"Authentication failed: {msg}")
             return False
         except (ConnectionError, OSError) as exc:
-            self._show_error(f"Could not connect: {exc}")
+            human = humanize_socket_error(exc)
+            logger.warning("connect failed: %s (errno=%s)", exc, getattr(exc, "errno", None))
+            self._show_error(f"Could not connect to {inputs.address}:{inputs.port}.\n\n{human}")
             return False
         except Exception as exc:
-            logger.exception("connect failed")
-            self._show_error(f"Connect failed: {exc}")
+            logger.exception("connect failed (unhandled)")
+            self._show_error(f"Connect failed: {exc.__class__.__name__}: {exc}\n\n"
+                             f"Details written to %APPDATA%\\RemoteControl\\app.log")
             return False
 
     # ---------- runtime: messages from host ----------
@@ -255,8 +283,7 @@ class ClientApp(QObject):
 
 
 def run() -> int:
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname).1s] %(name)s: %(message)s")
+    init_logging()
     qt = QApplication.instance() or QApplication(sys.argv)
     cfg = config.load()
     app = ClientApp(qt, cfg)
