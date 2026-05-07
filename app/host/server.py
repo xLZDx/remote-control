@@ -167,8 +167,18 @@ class HostServer:
         )
         try:
             await asyncio.wait_for(self._do_handshake(session, reader), config.HANDSHAKE_TIMEOUT_S)
-        except (asyncio.TimeoutError, ValueError, ConnectionError, OSError) as exc:
-            logger.warning("[%s] handshake failed: %s", peer, exc)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] handshake timed out after %.0fs (client never sent HELLO+AUTH; "
+                "if a cert-confirm dialog was open, the user may have been too slow)",
+                peer, config.HANDSHAKE_TIMEOUT_S,
+            )
+            await self._close_session(session)
+            return
+        except (ValueError, ConnectionError, OSError, asyncio.IncompleteReadError) as exc:
+            cls = exc.__class__.__name__
+            msg = str(exc) or "(no message)"
+            logger.warning("[%s] handshake failed: %s: %s", peer, cls, msg)
             await self._close_session(session)
             return
         except Exception:

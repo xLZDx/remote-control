@@ -193,7 +193,7 @@ class ClientApp(QObject):
         async def _connect_async() -> Any:
             return await asyncio.wait_for(
                 self.client.connect(pin=inputs.pin, confirm_new_fingerprint=_confirm),
-                timeout=12.0,
+                timeout=config.CLIENT_OVERALL_CONNECT_TIMEOUT_S,
             )
 
         target_label = (
@@ -204,14 +204,14 @@ class ClientApp(QObject):
         logger.info("connect attempt: %s", target_label)
         try:
             fut = self.worker.run_coro(_connect_async())
-            fut.result(timeout=15)
+            fut.result(timeout=config.CLIENT_OVERALL_CONNECT_TIMEOUT_S + 5)
             logger.info("connect success: %s", target_label)
             return True
         except asyncio.TimeoutError:
             if inputs.kind == "via_hub":
                 self._show_error(
                     f"Timed out connecting via Hub at {inputs.hub_address}:{inputs.hub_port} "
-                    f"to laptop '{inputs.laptop_name}' after 12 seconds.\n\n"
+                    f"to laptop '{inputs.laptop_name}'.\n\n"
                     "Likely causes:\n"
                     "  - the Hub PC is offline or its broker is not running\n"
                     "  - the Hub's router is not forwarding TCP/{hub_port} to the Hub PC\n"
@@ -220,12 +220,13 @@ class ClientApp(QObject):
                 )
             else:
                 self._show_error(
-                    f"Timed out trying to reach {inputs.address}:{inputs.port} after 12 seconds.\n\n"
+                    f"Connection to {inputs.address}:{inputs.port} did not complete.\n\n"
                     "Likely causes:\n"
                     "  - host PC is offline or has not started 'Share this PC'\n"
+                    "  - Windows Firewall on the host is blocking inbound TCP/{port}\n"
                     "  - if connecting from a different network, the host's router is not\n"
                     "    forwarding TCP/{port} to the host PC\n"
-                    "  - Windows Firewall on the host is blocking inbound on the port"
+                    "  - on first connect, the cert-confirm dialog was not clicked in time"
                     .replace("{port}", str(inputs.port))
                 )
             return False

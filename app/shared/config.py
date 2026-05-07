@@ -32,7 +32,10 @@ PIN_REGENERATE_ON_DISCONNECT = True
 
 # Protocol limits
 MAX_FRAME_BYTES = 16 * 1024 * 1024   # 16 MB hard cap on a single message
-HANDSHAKE_TIMEOUT_S = 10.0
+TCP_CONNECT_TIMEOUT_S = 10.0          # how long to wait for TCP+TLS to open
+HANDSHAKE_TIMEOUT_S = 90.0            # host-side: time to complete HELLO/AUTH (must
+                                       # accommodate user clicking through cert dialog)
+CLIENT_OVERALL_CONNECT_TIMEOUT_S = 90.0  # client-side outer wrap (same reason)
 IDLE_PING_INTERVAL_S = 5.0
 IDLE_TIMEOUT_S = 30.0
 

@@ -219,9 +219,15 @@ class HostClient:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
-            self.reader, self.writer = await asyncio.open_connection(
-                self.address, self.port, ssl=ssl_ctx
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.address, self.port, ssl=ssl_ctx),
+                timeout=config.TCP_CONNECT_TIMEOUT_S,
             )
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError(
+                f"TCP/TLS connect to {self.address}:{self.port} timed out after "
+                f"{config.TCP_CONNECT_TIMEOUT_S:.0f}s"
+            ) from exc
         except (ConnectionError, OSError, ssl.SSLError) as exc:
             raise ConnectionError(f"connect to {self.address}:{self.port} failed: {exc}") from exc
         host_key = f"{self.address}:{self.port}"
@@ -238,9 +244,15 @@ class HostClient:
         ssl_ctx.verify_mode = ssl.CERT_NONE
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         try:
-            self.reader, self.writer = await asyncio.open_connection(
-                vh.hub_address, vh.hub_port, ssl=ssl_ctx
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(vh.hub_address, vh.hub_port, ssl=ssl_ctx),
+                timeout=config.TCP_CONNECT_TIMEOUT_S,
             )
+        except asyncio.TimeoutError as exc:
+            raise ConnectionError(
+                f"TCP/TLS connect to Hub {vh.hub_address}:{vh.hub_port} timed out after "
+                f"{config.TCP_CONNECT_TIMEOUT_S:.0f}s"
+            ) from exc
         except (ConnectionError, OSError, ssl.SSLError) as exc:
             raise ConnectionError(
                 f"connect to Hub {vh.hub_address}:{vh.hub_port} failed: {exc}"
