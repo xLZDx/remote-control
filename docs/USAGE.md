@@ -40,6 +40,41 @@ If they don't match, **stop**. Either:
 - **Fullscreen** button to maximize.
 - If the host has multiple monitors, switch between them with the buttons in the toolbar.
 
+## Connecting across the internet without port-forwarding the laptop (Hub mode)
+
+If you have one PC with a stable public IP (the **Hub**) and other PCs (laptops) behind home/cafe NAT, set up Hub mode so any client can reach a laptop without configuring the laptop's router.
+
+### On the Hub PC (the one with the public IP)
+
+1. Launch RemoteControl, choose **Share this PC**.
+2. Tray icon -> **Hub Settings...** -> **Run as Hub** tab.
+3. Tick **Run Hub broker on this PC**. Default port is `7780` (separate from the host's `7777`).
+4. Port-forward TCP/7780 on your router to this PC (in addition to TCP/7777 if you also share this PC directly).
+5. Click **Add registration...**, type a name for the laptop (e.g. `work-laptop`).
+6. **Copy the displayed token immediately**. It's shown only once. Send it to the laptop user securely.
+
+### On the laptop (behind NAT)
+
+1. Launch RemoteControl, choose **Share this PC**.
+2. Tray -> **Hub Settings...** -> **Register with Hub** tab.
+3. Enter Hub address (the Hub PC's public IP), Hub port (default 7780), the laptop name agreed with the Hub admin, and the token.
+4. Click **Save and connect**. Status should change to `online` within a few seconds.
+
+The laptop now keeps a persistent outbound TLS tunnel to the Hub. There is **no port-forwarding required on the laptop side**.
+
+### To control the laptop from anywhere
+
+1. On the controlling PC, choose **Connect to a PC**.
+2. Switch to the **Via Hub** tab.
+3. Hub address = the Hub PC's public IP. Hub port = 7780. Laptop name = the registered name. PIN = the laptop's current PIN (shown on the laptop's PIN window).
+4. **Connect**.
+
+The Hub relays bytes between you and the laptop. The laptop's host runs the same TLS+PIN auth at its end of the tunnel.
+
+### Hub mode security
+
+In v1, the Hub is **inside** the trust path: the Hub admin can see the bytes flowing through. Use Hub mode only when the Hub PC is owned/trusted by you. End-to-end encryption that hides bytes from the Hub is on the roadmap. See [SECURITY.md](SECURITY.md).
+
 ## Hosting from behind a router
 
 This app is built for the case where the host has a **public IP** that doesn't change (a dedicated external IP, a static DDNS, or a port-forwarded home router).
