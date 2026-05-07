@@ -28,23 +28,26 @@ class _TimeoutErr(Exception):
     pass
 
 
-def _parse_output_info(text: str) -> list[tuple[int, int]]:
-    """Parse the multi-line string from `dxcam.output_info()` into a list of
-    (device_idx, output_idx) pairs. Format from dxcam:
+def _parse_output_info(text: str) -> list[tuple[int, int, int, int]]:
+    """Parse `dxcam.output_info()` text into (device_idx, output_idx, w, h)
+    tuples. Format from dxcam:
         Device[0] Output[0]: Res:(2560, 1440) Rot:0 Primary:True
         Device[1] Output[0]: Res:(3840, 2160) Rot:0 Primary:False
-    Returns [] on unrecognized format."""
+    Returns [] on unrecognized format. We pull width/height straight from
+    the text so we don't have to call dxcam.create() at enumeration time -
+    that call hangs on some adapters (single-monitor laptops have been
+    observed to freeze in cam.release()).
+    """
     import re
-    pairs: list[tuple[int, int]] = []
-    for m in re.finditer(r"Device\[(\d+)\]\s+Output\[(\d+)\]", text):
+    out: list[tuple[int, int, int, int]] = []
+    pat = re.compile(r"Device\[(\d+)\]\s+Output\[(\d+)\]\s*:\s*Res:\((\d+)\s*,\s*(\d+)\)")
+    for m in pat.finditer(text):
         try:
-            dev = int(m.group(1))
-            out = int(m.group(2))
+            out.append((int(m.group(1)), int(m.group(2)),
+                        int(m.group(3)), int(m.group(4))))
         except ValueError:
             continue
-        if (dev, out) not in pairs:
-            pairs.append((dev, out))
-    return pairs
+    return out
 
 
 def _call_with_timeout(fn, timeout_s: float):
@@ -121,71 +124,43 @@ class ScreenCapture:
     # ---------- monitor enumeration ----------
 
     def _enumerate_monitors(self) -> None:
-        """Enumerate displays. We parse `dxcam.output_info()` to know the exact
-        (device_idx, output_idx) pairs that exist, then probe only those.
+        """Enumerate displays from `dxcam.output_info()` text only - no
+        dxcam.create()/cam.release() calls here, because those have been
+        observed to hang on certain adapters (single-monitor laptops in
+        particular, where cam.release() freezes the process).
 
-        Blind probing (incrementing output_idx until failure) hangs on some
-        adapters because dxcam.create() can block the C-extension code in a
-        way Python-level timeouts can't interrupt. Parsing the text first
-        avoids that entirely.
+        The actual DXGI cam is created later in the capture worker thread,
+        where a hang only kills the worker, not the whole startup.
         """
         self._monitors = []
+        self._monitor_pairs: list[tuple[int, int]] = []
         if not _DXCAM_AVAILABLE:
             logger.warning("dxcam not available; using stub 1920x1080 monitor")
             self._monitors = [MonitorInfo(0, "Primary (stub)", 1920, 1080)]
+            self._monitor_pairs = [(0, 0)]
             return
 
-        # Step 1: ask dxcam to enumerate text - cheap, no DXGI Output Duplication created.
         try:
             output_info_text = _call_with_timeout(dxcam.output_info, timeout_s=5.0)
         except Exception as exc:
-            logger.warning("dxcam.output_info failed/hung: %s; falling back to (0,0) only", exc)
-            output_info_text = ""
-        else:
-            logger.info("dxcam.output_info raw:\n%s", str(output_info_text)[:1000])
-
-        pairs = _parse_output_info(str(output_info_text))
-        if not pairs:
-            # Best-effort: just probe (0, 0)
-            pairs = [(0, 0)]
-        logger.info("dxcam reports %d (device, output) pair(s): %s", len(pairs), pairs)
-
-        # Step 2: probe each known pair. We map them to a flat output_idx for
-        # dxcam.create(output_idx=...). Order: list index in pairs == output_idx
-        # we expose to the rest of the app.
-        self._monitor_pairs: list[tuple[int, int]] = []
-        for idx, (dev, out) in enumerate(pairs):
-            cam = None
-            try:
-                cam = _call_with_timeout(
-                    lambda d=dev, o=out: dxcam.create(device_idx=d, output_idx=o),
-                    timeout_s=5.0,
-                )
-            except _TimeoutErr:
-                logger.warning("dxcam.create(device=%d output=%d) timed out 5s; skipping", dev, out)
-                continue
-            except Exception as exc:
-                logger.warning("dxcam.create(device=%d output=%d) raised: %s", dev, out, exc)
-                continue
-            if cam is None:
-                logger.warning("dxcam.create(device=%d output=%d) returned None; skipping", dev, out)
-                continue
-            try:
-                w, h = cam.width, cam.height
-                self._monitors.append(MonitorInfo(idx, f"Display {idx + 1}", w, h))
-                self._monitor_pairs.append((dev, out))
-                logger.info("monitor %d: device=%d output=%d %dx%d",
-                            idx, dev, out, w, h)
-            finally:
-                try:
-                    cam.release()
-                except Exception:
-                    pass
-
-        if not self._monitors:
-            logger.warning("no usable monitors enumerated; using Primary stub")
-            self._monitors = [MonitorInfo(0, "Primary", 0, 0)]
+            logger.warning("dxcam.output_info failed/hung: %s; using fallback monitor", exc)
+            self._monitors = [MonitorInfo(0, "Primary", 1920, 1080)]
             self._monitor_pairs = [(0, 0)]
+            return
+        logger.info("dxcam.output_info raw:\n%s", str(output_info_text)[:1000])
+
+        parsed = _parse_output_info(str(output_info_text))
+        if not parsed:
+            logger.warning("could not parse output_info; using fallback (0,0) at 1920x1080")
+            self._monitors = [MonitorInfo(0, "Primary", 1920, 1080)]
+            self._monitor_pairs = [(0, 0)]
+            return
+
+        for idx, (dev, out, w, h) in enumerate(parsed):
+            self._monitors.append(MonitorInfo(idx, f"Display {idx + 1}", w, h))
+            self._monitor_pairs.append((dev, out))
+            logger.info("monitor %d: device=%d output=%d %dx%d (from output_info)",
+                        idx, dev, out, w, h)
 
     @property
     def monitors(self) -> list[MonitorInfo]:
