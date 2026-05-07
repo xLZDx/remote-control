@@ -1,15 +1,19 @@
 # Runtime dependencies (host + client)
-dxcam==0.0.5
-av==13.1.0
-PyQt6==6.7.1
-pystray==0.19.5
-Pillow==10.4.0
-pywin32==306
-cryptography==43.0.1
+# Note: minimum-version constraints rather than exact pins, to allow
+# Python 3.13 / 3.14 wheels. PyInstaller will lock against whatever
+# is in the build venv.
+dxcam>=0.0.5
+av>=13
+PyQt6>=6.7
+pystray>=0.19
+Pillow>=10
+pywin32>=306
+cryptography>=43
+numpy>=2
 
 # Build / packaging (dev only)
-pyinstaller==6.10.0
+pyinstaller>=6
 
 # Testing (dev only)
-pytest==8.3.3
-pytest-asyncio==0.24.0
+pytest>=8
+pytest-asyncio>=0.24
