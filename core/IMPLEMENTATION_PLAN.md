@@ -143,7 +143,7 @@ slow enough to be safe; 8-digit PIN option available in settings.
 
 Each phase ends with a git commit. Tests added/updated per CLAUDE.md rule.
 
-### Phase 1 — Network + auth foundation [STATUS: in progress]
+### Phase 1 — Network + auth foundation [STATUS: DONE — commit ea48c74, 25 tests passing]
 
 **Files**
 - `app/shared/config.py` — paths, constants, AppConfig
@@ -166,7 +166,7 @@ Each phase ends with a git commit. Tests added/updated per CLAUDE.md rule.
 
 ---
 
-### Phase 2 — Video pipeline
+### Phase 2 — Video pipeline [STATUS: DONE — commit 12dbbbf, 8 tests passing]
 
 **Files**
 - `app/host/capture.py` — `ScreenCapture`: dxcam loop, monitor enumeration,
@@ -191,7 +191,7 @@ Each phase ends with a git commit. Tests added/updated per CLAUDE.md rule.
 
 ---
 
-### Phase 3 — Input injection + capture
+### Phase 3 — Input injection + capture [STATUS: DONE — commit 7033a9e, 30 tests passing]
 
 **Files**
 - `app/host/input_injector.py` — `InputInjector` with:
@@ -217,7 +217,7 @@ Each phase ends with a git commit. Tests added/updated per CLAUDE.md rule.
 
 ---
 
-### Phase 4 — UI
+### Phase 4 — UI [STATUS: DONE — commit 5c0dbb7, 9 tests passing]
 
 **Files**
 - `app/host/tray.py` — `pystray` icon. Menu: Show PIN window, Regenerate PIN,
@@ -246,7 +246,7 @@ Each phase ends with a git commit. Tests added/updated per CLAUDE.md rule.
 
 ---
 
-### Phase 5 — Extras
+### Phase 5 — Extras [STATUS: DEFERRED — clipboard, file transfer, settings dialog, multi-monitor switch wiring not yet implemented]
 
 **Files**
 - Clipboard sync: extend `tray.py` and `viewer_window.py` to watch clipboard
@@ -271,7 +271,7 @@ Each phase ends with a git commit. Tests added/updated per CLAUDE.md rule.
 
 ---
 
-### Phase 6 — Package + tests + docs
+### Phase 6 — Package + tests + docs [STATUS: DONE — commit ebf416b; PyInstaller bundle builds (5.9 MB exe, 210 MB onedir) and the EXE successfully spawns the role picker on this machine]
 
 **Files**
 - `installer/host.spec` — PyInstaller spec for `RemoteControl.exe` (single
