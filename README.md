@@ -23,6 +23,10 @@ A self-contained Windows-to-Windows remote desktop tool. Two standalone EXEs (no
 - Host PC must be reachable from the client (this app is built for the case where the host has a public/dedicated IP, or both PCs are on the same LAN).
 - Inbound TCP on the chosen port allowed by Windows Firewall (the installer adds a rule).
 
+## Implementation plan
+
+The full phased implementation plan lives in [core/IMPLEMENTATION_PLAN.md](core/IMPLEMENTATION_PLAN.md). All planning documents for this project go under `core/`.
+
 ## Build from source
 
 See [docs/BUILD.md](docs/BUILD.md).
