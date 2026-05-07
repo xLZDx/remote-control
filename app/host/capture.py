@@ -24,6 +24,32 @@ except Exception as _exc:  # pragma: no cover - import-time
     logger.warning("dxcam unavailable: %s (capture will be disabled)", _exc)
 
 
+class _TimeoutErr(Exception):
+    pass
+
+
+def _call_with_timeout(fn, timeout_s: float):
+    """Run `fn` in a thread with a hard timeout. Raises _TimeoutErr on timeout.
+    Used to defang dxcam calls that may hang indefinitely on some adapters."""
+    result: list = [None]
+    error: list = [None]
+
+    def _worker() -> None:
+        try:
+            result[0] = fn()
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_worker, name="dxcam-probe", daemon=True)
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        raise _TimeoutErr(f"call did not return in {timeout_s}s")
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+
 @dataclass
 class MonitorInfo:
     index: int
@@ -68,42 +94,57 @@ class ScreenCapture:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._cam = None
         self._monitors: list[MonitorInfo] = []
+        logger.info("ScreenCapture.__init__: enumerating monitors (target_fps=%d, monitor_index=%d)",
+                    target_fps, monitor_index)
         self._enumerate_monitors()
+        logger.info("ScreenCapture.__init__: enumeration done, %d monitor(s) detected", len(self._monitors))
 
     # ---------- monitor enumeration ----------
 
     def _enumerate_monitors(self) -> None:
+        """Enumerate displays. dxcam.create() can hang on some Optimus laptops;
+        each probe is wrapped with a 5-second timeout so a single bad adapter
+        doesn't block startup forever."""
         self._monitors = []
         if not _DXCAM_AVAILABLE:
+            logger.warning("dxcam not available; using stub 1920x1080 monitor")
             self._monitors = [MonitorInfo(0, "Primary (stub)", 1920, 1080)]
             return
         try:
-            output_info = dxcam.output_info()  # multi-line text describing each output
-        except Exception as exc:  # pragma: no cover
-            logger.warning("dxcam.output_info failed: %s", exc)
+            output_info = _call_with_timeout(dxcam.output_info, timeout_s=5.0)
+            logger.debug("dxcam.output_info ok:\n%s", str(output_info)[:500])
+        except Exception as exc:
+            logger.warning("dxcam.output_info failed/hung: %s; falling back to single Primary stub", exc)
             self._monitors = [MonitorInfo(0, "Primary", 0, 0)]
             return
-        # output_info returns a printable string; we just enumerate by trying camera creation
         idx = 0
         while True:
+            logger.debug("probing dxcam output_idx=%d", idx)
+            cam = None
             try:
-                cam = dxcam.create(output_idx=idx)
-            except Exception:
+                cam = _call_with_timeout(lambda: dxcam.create(output_idx=idx), timeout_s=5.0)
+            except _TimeoutErr:
+                logger.warning("dxcam.create(output_idx=%d) timed out after 5s; skipping", idx)
+                break
+            except Exception as exc:
+                logger.debug("dxcam.create(output_idx=%d) failed: %s", idx, exc)
                 break
             if cam is None:
                 break
             try:
                 w, h = cam.width, cam.height
                 self._monitors.append(MonitorInfo(idx, f"Display {idx + 1}", w, h))
+                logger.info("monitor %d: Display %d %dx%d", idx, idx + 1, w, h)
             finally:
                 try:
                     cam.release()
                 except Exception:
                     pass
             idx += 1
-            if idx > 8:  # sanity cap
+            if idx > 8:
                 break
         if not self._monitors:
+            logger.warning("no usable monitors enumerated; using Primary stub")
             self._monitors = [MonitorInfo(0, "Primary", 0, 0)]
 
     @property
@@ -164,11 +205,15 @@ class ScreenCapture:
             logger.error("dxcam not available; capture thread exiting")
             return
         try:
+            logger.info("capture worker: creating dxcam (with GPU fallback grid, 5s/probe timeout)")
             self._cam = self._create_camera_with_fallback()
             if self._cam is None:
                 logger.error("dxcam.create failed for all GPUs / outputs")
                 return
+            logger.info("capture worker: dxcam created (output_idx=%d), starting acquisition",
+                        self.monitor_index)
             self._cam.start(target_fps=self.target_fps, video_mode=True)
+            logger.info("capture worker: dxcam.start ok (target_fps=%d)", self.target_fps)
             interval = 1.0 / max(self.target_fps, 1)
             next_t = time.monotonic()
             while not self._stop_evt.is_set():

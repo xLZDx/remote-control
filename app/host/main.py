@@ -40,6 +40,72 @@ from app.shared.protocol import Message, MessageType
 logger = logging.getLogger(__name__)
 
 
+def _resolve_log_path() -> str:
+    """Find which log file the bootstrap actually wrote to."""
+    from pathlib import Path as _P
+    if getattr(sys, "frozen", False):
+        try:
+            bundled = _P(sys.executable).resolve().parent / "logs" / "app.log"
+            if bundled.exists() or bundled.parent.exists():
+                return str(bundled)
+        except OSError:
+            pass
+    return str(config.appdata_dir() / "app.log")
+
+
+def _is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _ensure_firewall_rule(port: int) -> None:
+    """Add a Windows Firewall inbound rule for `port` if we're admin and the
+    rule isn't already there. Best-effort - never raises."""
+    import subprocess
+    rule_name = f"RemoteControl Host {port}"
+    try:
+        check = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule",
+             f"name={rule_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if check.returncode == 0 and "No rules match" not in check.stdout:
+            logger.info("firewall: rule '%s' already present", rule_name)
+            return
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    if not _is_admin():
+        logger.warning(
+            "firewall: not running as admin, cannot auto-add rule for port %d. "
+            "If clients on the LAN can't connect, run this once in an elevated "
+            "Command Prompt:\n"
+            "    netsh advfirewall firewall add rule name=\"RemoteControl Host %d\" "
+            "dir=in action=allow protocol=TCP localport=%d",
+            port, port, port,
+        )
+        return
+
+    try:
+        result = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}",
+             "dir=in", "action=allow", "protocol=TCP",
+             f"localport={port}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            logger.info("firewall: added rule '%s' for TCP/%d", rule_name, port)
+        else:
+            logger.warning("firewall: netsh add returned rc=%d: %s",
+                           result.returncode, result.stdout + result.stderr)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        logger.warning("firewall: could not run netsh: %s", exc)
+
+
 class _AsyncioWorker(QObject):
     """Owns the asyncio loop in a background thread."""
     sessions_changed = pyqtSignal()
@@ -144,7 +210,7 @@ class HostApp(QObject):
             fut.result(timeout=20)
         except Exception as exc:
             logger.exception("startup failed")
-            log_path = config.appdata_dir() / "app.log"
+            log_path = _resolve_log_path()
             QMessageBox.critical(
                 None, "RemoteControl - startup failed",
                 f"{exc.__class__.__name__}: {exc}\n\n"
@@ -243,6 +309,7 @@ class HostApp(QObject):
             ) from exc
         asyncio.create_task(self.server.serve_forever())
         logger.info("server listening on %s:%d", self.cfg.host.bind_address, self.cfg.host.port)
+        _ensure_firewall_rule(self.cfg.host.port)
 
         # capture pump
         self._capture_task = asyncio.create_task(self._pump_capture())
@@ -347,7 +414,21 @@ class HostApp(QObject):
     def _open_log_folder(self) -> None:
         import os
         import subprocess
-        path = str(config.appdata_dir())
+        # Find which log dir the bootstrap actually used
+        candidates: list[str] = []
+        if getattr(sys, "frozen", False):
+            try:
+                from pathlib import Path as _P
+                bundled = _P(sys.executable).resolve().parent / "logs"
+                if (bundled / "app.log").exists():
+                    candidates.append(str(bundled))
+            except OSError:
+                pass
+        if (config.appdata_dir() / "app.log").exists():
+            candidates.append(str(config.appdata_dir()))
+        if not candidates:
+            candidates.append(str(config.appdata_dir()))
+        path = candidates[0]
         try:
             os.startfile(path)  # type: ignore[attr-defined]
         except Exception:
@@ -535,7 +616,8 @@ class HostApp(QObject):
 
 
 def run() -> int:
-    log_path = init_logging()
+    init_logging()
+    log_path = _resolve_log_path()
     logger.info("=== RemoteControl host starting ===")
     logger.info("log: %s", log_path)
     qt = QApplication.instance() or QApplication(sys.argv)

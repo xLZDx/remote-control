@@ -32,9 +32,31 @@ def _appdata_dir() -> Path:
     return p
 
 
+def _bundled_log_dir() -> Path | None:
+    """When running as a frozen exe, prefer <exe_dir>/logs so the log
+    travels with the bundle. Returns None if not frozen or not writable."""
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        exe_dir = Path(sys.executable).resolve().parent
+    except OSError:
+        return None
+    candidate = exe_dir / "logs"
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+        # writability probe
+        probe = candidate / ".write_test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return candidate
+    except OSError:
+        return None
+
+
 def _bootstrap_logging() -> Path:
     """Set up a rotating file log + excepthook. Stdlib only - safe to call first."""
-    log_path = _appdata_dir() / "app.log"
+    log_dir = _bundled_log_dir() or _appdata_dir()
+    log_path = log_dir / "app.log"
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname).1s] %(name)s: %(message)s")
