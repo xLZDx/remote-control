@@ -148,51 +148,35 @@ def _enforce_single_instance(role: str) -> bool:
     last_err = kernel32.GetLastError()
 
     if last_err == ERROR_ALREADY_EXISTS:
-        # Stash a *new* handle - the old one is owned by the original instance.
-        # We hold this so a later instance also gets ALREADY_EXISTS.
         proceed = _show_warning_dialog(
             f"RemoteControl is already running ({role} mode).\n\n"
-            "If you want to launch a fresh copy, find the existing\n"
-            "RemoteControl.exe in Task Manager (Ctrl+Shift+Esc) and End Task on\n"
-            "every one of them, then re-launch.\n\n"
-            "Click 'Yes' to attempt to terminate any existing RemoteControl.exe\n"
-            "processes and continue, or 'No' to cancel this launch.",
+            "Click 'Yes' to terminate ALL RemoteControl.exe processes (including\n"
+            "this launch). Then re-launch RemoteControl manually.\n\n"
+            "Click 'No' to cancel this launch.",
             title="RemoteControl - already running",
         )
         if not proceed:
             return False
         _kill_other_remotecontrol_processes()
-        # Give the OS a moment to release the mutex/sockets
-        import time
-        time.sleep(2.0)
-        # Re-attempt
-        handle = kernel32.CreateMutexW(None, False, name)
-        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            _show_fatal_dialog(
-                "Could not start: a RemoteControl process is still running and\n"
-                "could not be terminated automatically. End it via Task Manager\n"
-                "and try again."
-            )
-            return False
+        # taskkill /F /IM kills us too - the OS will terminate this process
+        # shortly. If by some chance we keep running, just exit cleanly so the
+        # user can re-launch from a clean slate.
+        return False
     # Keep the handle alive for the process lifetime by stuffing it on a module.
     globals()["_singleton_mutex_handle"] = handle
     return True
 
 
 def _kill_other_remotecontrol_processes() -> None:
-    """Kill any RemoteControl.exe other than ourselves. Best-effort, no crash."""
+    """Kill ALL RemoteControl.exe processes (including this one). The OS will
+    terminate us shortly after; the user is expected to re-launch."""
     try:
-        import ctypes
-        import os
-        from ctypes import wintypes
         import subprocess
     except Exception:
         return
-    my_pid = os.getpid()
     try:
-        # /F = force; /FI excludes our own PID
         subprocess.run(
-            ["taskkill", "/F", "/IM", "RemoteControl.exe", "/FI", f"PID ne {my_pid}"],
+            ["taskkill", "/F", "/IM", "RemoteControl.exe"],
             capture_output=True, timeout=5,
         )
     except Exception:
