@@ -28,6 +28,25 @@ class _TimeoutErr(Exception):
     pass
 
 
+def _parse_output_info(text: str) -> list[tuple[int, int]]:
+    """Parse the multi-line string from `dxcam.output_info()` into a list of
+    (device_idx, output_idx) pairs. Format from dxcam:
+        Device[0] Output[0]: Res:(2560, 1440) Rot:0 Primary:True
+        Device[1] Output[0]: Res:(3840, 2160) Rot:0 Primary:False
+    Returns [] on unrecognized format."""
+    import re
+    pairs: list[tuple[int, int]] = []
+    for m in re.finditer(r"Device\[(\d+)\]\s+Output\[(\d+)\]", text):
+        try:
+            dev = int(m.group(1))
+            out = int(m.group(2))
+        except ValueError:
+            continue
+        if (dev, out) not in pairs:
+            pairs.append((dev, out))
+    return pairs
+
+
 def _call_with_timeout(fn, timeout_s: float):
     """Run `fn` in a thread with a hard timeout. Raises _TimeoutErr on timeout.
     Used to defang dxcam calls that may hang indefinitely on some adapters."""
@@ -102,50 +121,71 @@ class ScreenCapture:
     # ---------- monitor enumeration ----------
 
     def _enumerate_monitors(self) -> None:
-        """Enumerate displays. dxcam.create() can hang on some Optimus laptops;
-        each probe is wrapped with a 5-second timeout so a single bad adapter
-        doesn't block startup forever."""
+        """Enumerate displays. We parse `dxcam.output_info()` to know the exact
+        (device_idx, output_idx) pairs that exist, then probe only those.
+
+        Blind probing (incrementing output_idx until failure) hangs on some
+        adapters because dxcam.create() can block the C-extension code in a
+        way Python-level timeouts can't interrupt. Parsing the text first
+        avoids that entirely.
+        """
         self._monitors = []
         if not _DXCAM_AVAILABLE:
             logger.warning("dxcam not available; using stub 1920x1080 monitor")
             self._monitors = [MonitorInfo(0, "Primary (stub)", 1920, 1080)]
             return
+
+        # Step 1: ask dxcam to enumerate text - cheap, no DXGI Output Duplication created.
         try:
-            output_info = _call_with_timeout(dxcam.output_info, timeout_s=5.0)
-            logger.debug("dxcam.output_info ok:\n%s", str(output_info)[:500])
+            output_info_text = _call_with_timeout(dxcam.output_info, timeout_s=5.0)
         except Exception as exc:
-            logger.warning("dxcam.output_info failed/hung: %s; falling back to single Primary stub", exc)
-            self._monitors = [MonitorInfo(0, "Primary", 0, 0)]
-            return
-        idx = 0
-        while True:
-            logger.debug("probing dxcam output_idx=%d", idx)
+            logger.warning("dxcam.output_info failed/hung: %s; falling back to (0,0) only", exc)
+            output_info_text = ""
+        else:
+            logger.info("dxcam.output_info raw:\n%s", str(output_info_text)[:1000])
+
+        pairs = _parse_output_info(str(output_info_text))
+        if not pairs:
+            # Best-effort: just probe (0, 0)
+            pairs = [(0, 0)]
+        logger.info("dxcam reports %d (device, output) pair(s): %s", len(pairs), pairs)
+
+        # Step 2: probe each known pair. We map them to a flat output_idx for
+        # dxcam.create(output_idx=...). Order: list index in pairs == output_idx
+        # we expose to the rest of the app.
+        self._monitor_pairs: list[tuple[int, int]] = []
+        for idx, (dev, out) in enumerate(pairs):
             cam = None
             try:
-                cam = _call_with_timeout(lambda: dxcam.create(output_idx=idx), timeout_s=5.0)
+                cam = _call_with_timeout(
+                    lambda d=dev, o=out: dxcam.create(device_idx=d, output_idx=o),
+                    timeout_s=5.0,
+                )
             except _TimeoutErr:
-                logger.warning("dxcam.create(output_idx=%d) timed out after 5s; skipping", idx)
-                break
+                logger.warning("dxcam.create(device=%d output=%d) timed out 5s; skipping", dev, out)
+                continue
             except Exception as exc:
-                logger.debug("dxcam.create(output_idx=%d) failed: %s", idx, exc)
-                break
+                logger.warning("dxcam.create(device=%d output=%d) raised: %s", dev, out, exc)
+                continue
             if cam is None:
-                break
+                logger.warning("dxcam.create(device=%d output=%d) returned None; skipping", dev, out)
+                continue
             try:
                 w, h = cam.width, cam.height
                 self._monitors.append(MonitorInfo(idx, f"Display {idx + 1}", w, h))
-                logger.info("monitor %d: Display %d %dx%d", idx, idx + 1, w, h)
+                self._monitor_pairs.append((dev, out))
+                logger.info("monitor %d: device=%d output=%d %dx%d",
+                            idx, dev, out, w, h)
             finally:
                 try:
                     cam.release()
                 except Exception:
                     pass
-            idx += 1
-            if idx > 8:
-                break
+
         if not self._monitors:
             logger.warning("no usable monitors enumerated; using Primary stub")
             self._monitors = [MonitorInfo(0, "Primary", 0, 0)]
+            self._monitor_pairs = [(0, 0)]
 
     @property
     def monitors(self) -> list[MonitorInfo]:
@@ -248,40 +288,38 @@ class ScreenCapture:
             self._cam = None
 
     def _create_camera_with_fallback(self):
-        """Try (device_idx, output_idx) combinations until one succeeds.
-
-        On laptops with hybrid graphics (NVIDIA Optimus / AMD Switchable),
-        the primary display might be attached to a different DXGI adapter
-        than dxcam's default. We brute-force a small grid.
+        """Use the (device_idx, output_idx) pairs we already discovered during
+        enumeration (no more blind probing of indices that may hang).
         """
-        # First the user-requested output on the default device (matches old behavior)
-        attempts = [(None, self.monitor_index)]
-        # Then enumerate small grid
-        for d in range(0, 4):
-            for o in range(0, 4):
-                if (d, o) not in attempts and (None, o) not in attempts:
-                    attempts.append((d, o))
+        pairs = list(getattr(self, "_monitor_pairs", []))
+        if not pairs:
+            pairs = [(0, 0)]
+
+        # Move the requested monitor_index to the front
+        if 0 <= self.monitor_index < len(pairs):
+            pairs = [pairs[self.monitor_index]] + [
+                p for i, p in enumerate(pairs) if i != self.monitor_index
+            ]
 
         last_exc: Exception | None = None
-        for device_idx, output_idx in attempts:
+        for dev, out in pairs:
             try:
-                if device_idx is None:
-                    cam = dxcam.create(output_idx=output_idx, output_color="BGR")
-                else:
-                    cam = dxcam.create(device_idx=device_idx, output_idx=output_idx, output_color="BGR")
+                cam = _call_with_timeout(
+                    lambda d=dev, o=out: dxcam.create(
+                        device_idx=d, output_idx=o, output_color="BGR"
+                    ),
+                    timeout_s=5.0,
+                )
                 if cam is not None:
-                    if device_idx is not None or output_idx != self.monitor_index:
-                        logger.warning(
-                            "dxcam fell back to device_idx=%s output_idx=%d "
-                            "(requested output_idx=%d)",
-                            device_idx, output_idx, self.monitor_index,
-                        )
-                    self.monitor_index = output_idx
+                    logger.info("capture worker: dxcam.create OK (device=%d output=%d)", dev, out)
                     return cam
+            except _TimeoutErr:
+                logger.warning("capture worker: dxcam.create(device=%d output=%d) timed out 5s", dev, out)
+                continue
             except Exception as exc:
                 last_exc = exc
-                logger.debug("dxcam.create(device_idx=%s, output_idx=%d) failed: %s",
-                             device_idx, output_idx, exc)
+                logger.warning("capture worker: dxcam.create(device=%d output=%d) failed: %s",
+                               dev, out, exc)
                 continue
         if last_exc is not None:
             logger.error("dxcam.create exhausted all attempts; last error: %s", last_exc)
