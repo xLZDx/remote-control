@@ -117,6 +117,88 @@ def _show_fatal_dialog(text: str) -> None:
         pass
 
 
+def _show_warning_dialog(text: str, title: str = "RemoteControl") -> bool:
+    """Yes/No dialog. Returns True if Yes."""
+    try:
+        import ctypes
+        # MB_YESNO=4, MB_ICONQUESTION=0x20; IDYES=6
+        result = ctypes.windll.user32.MessageBoxW(0, text, title, 4 | 0x20)
+        return result == 6
+    except Exception:
+        return False
+
+
+def _enforce_single_instance(role: str) -> bool:
+    """Return True if we should proceed (we're the only instance), False if
+    another RemoteControl is already running and the user said 'cancel'.
+
+    Uses a Windows named mutex so the check is process-fast and doesn't
+    require port-scanning. The mutex is held for the lifetime of the process
+    (the OS releases it on exit)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return True
+    name = f"Global\\RemoteControl_{role}"
+    ERROR_ALREADY_EXISTS = 183
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, name)
+    last_err = kernel32.GetLastError()
+
+    if last_err == ERROR_ALREADY_EXISTS:
+        # Stash a *new* handle - the old one is owned by the original instance.
+        # We hold this so a later instance also gets ALREADY_EXISTS.
+        proceed = _show_warning_dialog(
+            f"RemoteControl is already running ({role} mode).\n\n"
+            "If you want to launch a fresh copy, find the existing\n"
+            "RemoteControl.exe in Task Manager (Ctrl+Shift+Esc) and End Task on\n"
+            "every one of them, then re-launch.\n\n"
+            "Click 'Yes' to attempt to terminate any existing RemoteControl.exe\n"
+            "processes and continue, or 'No' to cancel this launch.",
+            title="RemoteControl - already running",
+        )
+        if not proceed:
+            return False
+        _kill_other_remotecontrol_processes()
+        # Give the OS a moment to release the mutex/sockets
+        import time
+        time.sleep(2.0)
+        # Re-attempt
+        handle = kernel32.CreateMutexW(None, False, name)
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            _show_fatal_dialog(
+                "Could not start: a RemoteControl process is still running and\n"
+                "could not be terminated automatically. End it via Task Manager\n"
+                "and try again."
+            )
+            return False
+    # Keep the handle alive for the process lifetime by stuffing it on a module.
+    globals()["_singleton_mutex_handle"] = handle
+    return True
+
+
+def _kill_other_remotecontrol_processes() -> None:
+    """Kill any RemoteControl.exe other than ourselves. Best-effort, no crash."""
+    try:
+        import ctypes
+        import os
+        from ctypes import wintypes
+        import subprocess
+    except Exception:
+        return
+    my_pid = os.getpid()
+    try:
+        # /F = force; /FI excludes our own PID
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "RemoteControl.exe", "/FI", f"PID ne {my_pid}"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def _run_host() -> int:
     try:
         from app.host import main as host_main
@@ -188,9 +270,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("role", nargs="?", choices=["host", "client"])
     args = parser.parse_args(argv)
     if args.role == "host":
+        if not _enforce_single_instance("host"):
+            return 0
         return _run_host()
     if args.role == "client":
+        # Multiple clients are fine (different connections); skip mutex.
         return _run_client()
+    # Picker mode: also single-instance to avoid duplicate role pickers
+    if not _enforce_single_instance("picker"):
+        return 0
     return _run_picker()
 
 
