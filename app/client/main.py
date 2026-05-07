@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app.client.connect_dialog import ConnectDialog, ConnectInputs, FingerprintConfirmDialog
 from app.client.decoder import H264Decoder
-from app.client.tcp_client import HostClient, AuthError, FingerprintMismatchError
+from app.client.tcp_client import HostClient, ViaHub, AuthError, FingerprintMismatchError
 from app.client.viewer_window import ViewerWindow
 from app.shared import config, protocol
 from app.shared.config import SavedConnection
@@ -93,29 +93,51 @@ class ClientApp(QObject):
         while True:
             dlg = ConnectDialog(self.cfg.client)
             if last_inputs is not None:
-                dlg.address_edit.setText(last_inputs.address)
-                dlg.port_spin.setValue(last_inputs.port)
                 dlg.pin_edit.setFocus()
             if dlg.exec() != dlg.DialogCode.Accepted:
                 return 0
             inputs = dlg.values()
             last_inputs = inputs
-            if not inputs.address or not inputs.pin:
-                QMessageBox.warning(None, "RemoteControl", "Address and PIN are required.")
+            if not inputs.pin:
+                QMessageBox.warning(None, "RemoteControl", "PIN is required.")
                 continue
+            if inputs.kind == "via_hub":
+                if not inputs.hub_address or not inputs.laptop_name:
+                    QMessageBox.warning(None, "RemoteControl",
+                                        "Hub address and laptop name are required.")
+                    continue
+            else:
+                if not inputs.address:
+                    QMessageBox.warning(None, "RemoteControl", "Address is required.")
+                    continue
             ok = self._do_connect(inputs)
             if ok:
                 break
 
         # remember (last + saved)
-        self.cfg.client.last_address = inputs.address
-        self.cfg.client.last_port = inputs.port
-        if inputs.save_name:
-            self.cfg.client.upsert_saved(SavedConnection(
-                name=inputs.save_name,
-                address=inputs.address,
-                port=inputs.port,
-            ))
+        if inputs.kind == "via_hub":
+            self.cfg.client.last_hub_address = inputs.hub_address
+            self.cfg.client.last_hub_port = inputs.hub_port
+            self.cfg.client.last_laptop_name = inputs.laptop_name
+            if inputs.save_name:
+                self.cfg.client.upsert_saved(SavedConnection(
+                    name=inputs.save_name,
+                    address="",
+                    kind="via_hub",
+                    hub_address=inputs.hub_address,
+                    hub_port=inputs.hub_port,
+                    laptop_name=inputs.laptop_name,
+                ))
+        else:
+            self.cfg.client.last_address = inputs.address
+            self.cfg.client.last_port = inputs.port
+            if inputs.save_name:
+                self.cfg.client.upsert_saved(SavedConnection(
+                    name=inputs.save_name,
+                    address=inputs.address,
+                    port=inputs.port,
+                    kind="direct",
+                ))
         try:
             config.save(self.cfg)
         except Exception:
@@ -141,7 +163,18 @@ class ClientApp(QObject):
     # ---------- connect flow ----------
 
     def _do_connect(self, inputs: ConnectInputs) -> bool:
-        self.client = HostClient(inputs.address, inputs.port)
+        if inputs.kind == "via_hub":
+            self.client = HostClient(
+                address="(via-hub)",
+                port=0,
+                via_hub=ViaHub(
+                    hub_address=inputs.hub_address,
+                    hub_port=inputs.hub_port,
+                    laptop_name=inputs.laptop_name,
+                ),
+            )
+        else:
+            self.client = HostClient(inputs.address, inputs.port)
         self.decoder = H264Decoder()
         self.client.on_message = self._on_message  # noop until connected, but set early
 
@@ -163,22 +196,38 @@ class ClientApp(QObject):
                 timeout=12.0,
             )
 
-        logger.info("connect attempt: %s:%d", inputs.address, inputs.port)
+        target_label = (
+            f"hub:{inputs.hub_address}:{inputs.hub_port} -> {inputs.laptop_name}"
+            if inputs.kind == "via_hub"
+            else f"{inputs.address}:{inputs.port}"
+        )
+        logger.info("connect attempt: %s", target_label)
         try:
             fut = self.worker.run_coro(_connect_async())
             fut.result(timeout=15)
-            logger.info("connect success: %s:%d", inputs.address, inputs.port)
+            logger.info("connect success: %s", target_label)
             return True
         except asyncio.TimeoutError:
-            self._show_error(
-                f"Timed out trying to reach {inputs.address}:{inputs.port} after 12 seconds.\n\n"
-                "Likely causes:\n"
-                "  - host PC is offline or has not started 'Share this PC'\n"
-                "  - if connecting from a different network, the host's router is not\n"
-                "    forwarding TCP/{port} to the host PC\n"
-                "  - Windows Firewall on the host is blocking inbound on the port"
-                .replace("{port}", str(inputs.port))
-            )
+            if inputs.kind == "via_hub":
+                self._show_error(
+                    f"Timed out connecting via Hub at {inputs.hub_address}:{inputs.hub_port} "
+                    f"to laptop '{inputs.laptop_name}' after 12 seconds.\n\n"
+                    "Likely causes:\n"
+                    "  - the Hub PC is offline or its broker is not running\n"
+                    "  - the Hub's router is not forwarding TCP/{hub_port} to the Hub PC\n"
+                    "  - the named laptop has not registered or its tunnel dropped"
+                    .replace("{hub_port}", str(inputs.hub_port))
+                )
+            else:
+                self._show_error(
+                    f"Timed out trying to reach {inputs.address}:{inputs.port} after 12 seconds.\n\n"
+                    "Likely causes:\n"
+                    "  - host PC is offline or has not started 'Share this PC'\n"
+                    "  - if connecting from a different network, the host's router is not\n"
+                    "    forwarding TCP/{port} to the host PC\n"
+                    "  - Windows Firewall on the host is blocking inbound on the port"
+                    .replace("{port}", str(inputs.port))
+                )
             return False
         except FingerprintMismatchError as exc:
             self._show_error(
@@ -198,7 +247,7 @@ class ClientApp(QObject):
         except (ConnectionError, OSError) as exc:
             human = humanize_socket_error(exc)
             logger.warning("connect failed: %s (errno=%s)", exc, getattr(exc, "errno", None))
-            self._show_error(f"Could not connect to {inputs.address}:{inputs.port}.\n\n{human}")
+            self._show_error(f"Could not connect to {target_label}.\n\n{human}")
             return False
         except Exception as exc:
             logger.exception("connect failed (unhandled)")

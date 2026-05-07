@@ -18,6 +18,9 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from app.shared import config, crypto, protocol
+from app.shared.hub_protocol import (
+    hello_connect_via, read_hub_message, write_hub_message,
+)
 from app.shared.protocol import Message, MessageType
 
 logger = logging.getLogger(__name__)
@@ -60,16 +63,26 @@ def save_pins(pins: dict[str, str], path: Path = config.PINNED_CERTS_PATH) -> No
 
 # ---- client ----
 
+@dataclass
+class ViaHub:
+    """Parameters for connecting through the Hub broker."""
+    hub_address: str
+    hub_port: int
+    laptop_name: str
+
+
 class HostClient:
     def __init__(
         self,
         address: str,
         port: int = config.DEFAULT_PORT,
         client_name: str | None = None,
+        via_hub: ViaHub | None = None,
     ) -> None:
         self.address = address
         self.port = port
         self.client_name = client_name or socket.gethostname() or "client"
+        self.via_hub = via_hub
 
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
@@ -103,50 +116,18 @@ class HostClient:
         """
         Connect, validate fingerprint, run handshake. Returns HostInfo on success.
         `confirm_new_fingerprint(host_key, fingerprint)` is awaited only when the
-        host has no existing pin; if it returns False, the connection is aborted.
+        target has no existing pin; if it returns False, the connection is aborted.
+
+        In direct mode, the pinned cert is the host's. In via-Hub mode it's the
+        Hub's (the laptop's host cert is not seen end-to-end in v1; see
+        SECURITY.md).
         """
-        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE     # we do our own pinning
-        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-
-        try:
-            self.reader, self.writer = await asyncio.open_connection(
-                self.address, self.port, ssl=ssl_ctx
-            )
-        except (ConnectionError, OSError, ssl.SSLError) as exc:
-            raise ConnectionError(f"connect to {self.address}:{self.port} failed: {exc}") from exc
-
-        # cert fingerprint check
-        ssl_obj: ssl.SSLObject | None = self.writer.get_extra_info("ssl_object")
-        cert_der = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
-        if not cert_der:
-            await self.close()
-            raise ConnectionError("no peer cert")
-        from cryptography import x509
-        from cryptography.hazmat.primitives import serialization
-        cert = x509.load_der_x509_certificate(cert_der)
-        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-        fp = crypto.cert_fingerprint(cert_pem)
-
-        host_key = f"{self.address}:{self.port}"
-        pins = load_pins()
-        existing = pins.get(host_key)
-        if existing:
-            if existing != fp:
-                await self.close()
-                raise FingerprintMismatchError(existing, fp)
+        if self.via_hub is not None:
+            await self._open_via_hub(confirm_new_fingerprint)
         else:
-            ok = True
-            if confirm_new_fingerprint is not None:
-                ok = await confirm_new_fingerprint(host_key, fp)
-            if not ok:
-                await self.close()
-                raise AuthError("user rejected new fingerprint")
-            pins[host_key] = fp
-            save_pins(pins)
+            await self._open_direct(confirm_new_fingerprint)
 
-        # ---- application handshake ----
+        # ---- application handshake (same code path for both transports) ----
         await self.send(protocol.hello(self.client_name))
 
         msg = await asyncio.wait_for(protocol.read_message(self.reader), config.HANDSHAKE_TIMEOUT_S)
@@ -177,10 +158,15 @@ class HostClient:
         self.host_info = HostInfo(
             name=str(hello_ack.get("host_name") or "host"),
             monitors=list(hello_ack.get("monitors") or []),
-            fingerprint=fp,
+            fingerprint=getattr(self, "_opened_fingerprint", ""),
         )
         self._receive_task = asyncio.create_task(self._recv_loop())
-        logger.info("connected to %s (%s)", host_key, self.host_info.name)
+        target_label = (
+            f"hub:{self.via_hub.hub_address}:{self.via_hub.hub_port} -> {self.via_hub.laptop_name}"
+            if self.via_hub is not None
+            else f"{self.address}:{self.port}"
+        )
+        logger.info("connected to %s (%s)", target_label, self.host_info.name)
         return self.host_info
 
     async def _recv_loop(self) -> None:
@@ -221,3 +207,93 @@ class HostClient:
             except (ConnectionError, OSError):
                 pass
             self.writer = None
+
+    # ---------- transport openers ----------
+
+    async def _open_direct(
+        self,
+        confirm_new_fingerprint: Callable[[str, str], Awaitable[bool]] | None,
+    ) -> None:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            self.reader, self.writer = await asyncio.open_connection(
+                self.address, self.port, ssl=ssl_ctx
+            )
+        except (ConnectionError, OSError, ssl.SSLError) as exc:
+            raise ConnectionError(f"connect to {self.address}:{self.port} failed: {exc}") from exc
+        host_key = f"{self.address}:{self.port}"
+        await self._verify_fingerprint(host_key, confirm_new_fingerprint)
+
+    async def _open_via_hub(
+        self,
+        confirm_new_fingerprint: Callable[[str, str], Awaitable[bool]] | None,
+    ) -> None:
+        assert self.via_hub is not None
+        vh = self.via_hub
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        try:
+            self.reader, self.writer = await asyncio.open_connection(
+                vh.hub_address, vh.hub_port, ssl=ssl_ctx
+            )
+        except (ConnectionError, OSError, ssl.SSLError) as exc:
+            raise ConnectionError(
+                f"connect to Hub {vh.hub_address}:{vh.hub_port} failed: {exc}"
+            ) from exc
+
+        host_key = f"hub:{vh.hub_address}:{vh.hub_port}"
+        await self._verify_fingerprint(host_key, confirm_new_fingerprint)
+
+        # Tell the Hub which laptop we want to reach
+        try:
+            await write_hub_message(self.writer, hello_connect_via(vh.laptop_name))
+            ack = await read_hub_message(self.reader, timeout=10.0)
+        except (ConnectionError, OSError, ValueError, asyncio.TimeoutError) as exc:
+            await self.close()
+            raise ConnectionError(f"Hub HELLO failed: {exc}") from exc
+
+        if not ack.get("ok"):
+            await self.close()
+            raise AuthError(str(ack.get("reason") or "Hub rejected the connect_via"))
+        # From here on, reader/writer is transparently relaying to the laptop's
+        # plaintext loopback host listener.
+
+    async def _verify_fingerprint(
+        self,
+        host_key: str,
+        confirm_new_fingerprint: Callable[[str, str], Awaitable[bool]] | None,
+    ) -> None:
+        assert self.writer is not None
+        ssl_obj: ssl.SSLObject | None = self.writer.get_extra_info("ssl_object")
+        cert_der = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
+        if not cert_der:
+            await self.close()
+            raise ConnectionError("no peer cert")
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        cert = x509.load_der_x509_certificate(cert_der)
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+        fp = crypto.cert_fingerprint(cert_pem)
+
+        pins = load_pins()
+        existing = pins.get(host_key)
+        if existing:
+            if existing != fp:
+                await self.close()
+                raise FingerprintMismatchError(existing, fp)
+        else:
+            ok = True
+            if confirm_new_fingerprint is not None:
+                ok = await confirm_new_fingerprint(host_key, fp)
+            if not ok:
+                await self.close()
+                raise AuthError("user rejected new fingerprint")
+            pins[host_key] = fp
+            save_pins(pins)
+        # Stash for HostInfo if direct mode; via-Hub will overwrite later.
+        self._opened_fingerprint = fp

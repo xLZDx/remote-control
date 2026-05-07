@@ -30,6 +30,7 @@ def _make_icon(text: str = "RC") -> QIcon:
 class HostTray(QSystemTrayIcon):
     show_window_requested = pyqtSignal()
     regenerate_pin_requested = pyqtSignal()
+    hub_settings_requested = pyqtSignal()
     quit_requested = pyqtSignal()
 
     def __init__(self, get_status_text: Callable[[], str]) -> None:
@@ -44,6 +45,10 @@ class HostTray(QSystemTrayIcon):
         regen_action = QAction("Regenerate PIN", menu)
         regen_action.triggered.connect(self.regenerate_pin_requested)
         menu.addAction(regen_action)
+
+        hub_action = QAction("Hub Settings...", menu)
+        hub_action.triggered.connect(self.hub_settings_requested)
+        menu.addAction(hub_action)
 
         menu.addSeparator()
 

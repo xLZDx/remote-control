@@ -22,10 +22,17 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from app.host.capture import ScreenCapture
 from app.host.encoder import H264Encoder
 from app.host.frame_broadcaster import FrameBroadcaster
+from app.host.hub_settings import HubSettingsCallbacks, HubSettingsDialog
 from app.host.input_injector import InputInjector
+from app.host.registration import (
+    HubRegistrar, HubRegistrationConfig, clear_registration,
+    load_registration, save_registration,
+)
 from app.host.server import HostServer, ClientSession
 from app.host.tray import HostTray
 from app.host.ui_pin import HostPinWindow
+from app.hub.registry import HubRegistry
+from app.hub.server import HubServer
 from app.shared import config, crypto, protocol
 from app.shared.logging_setup import init_logging
 from app.shared.protocol import Message, MessageType
@@ -93,6 +100,15 @@ class HostApp(QObject):
         self.server: HostServer | None = None
         self._capture_task: asyncio.Task | None = None
 
+        # Hub broker (only running on the dedicated-IP PC)
+        self.hub_registry = HubRegistry()
+        self.hub_server: HubServer | None = None
+        self._hub_serve_task: asyncio.Task | None = None
+
+        # Laptop registrar (only running on PCs that registered with a Hub)
+        self.registrar: HubRegistrar | None = None
+        self._loopback_started = False
+
         self.worker = _AsyncioWorker()
         self.worker.start()
 
@@ -101,7 +117,9 @@ class HostApp(QObject):
         self.tray.show_window_requested.connect(self._show_window)
         self.tray.regenerate_pin_requested.connect(self.regenerate_pin)
         self.tray.quit_requested.connect(self.quit)
+        self.tray.hub_settings_requested.connect(self._show_hub_settings)
         self.tray.show()
+        self._hub_dialog: HubSettingsDialog | None = None
 
         self.window = HostPinWindow(
             get_pin=lambda: self._pin,
@@ -229,6 +247,15 @@ class HostApp(QObject):
         self._capture_task = asyncio.create_task(self._pump_capture())
         logger.info("host startup complete")
 
+        # Hub broker (if configured to run on this PC)
+        if self.cfg.host.hub_enabled:
+            await self._start_hub_server_async(self.cfg.host.hub_port)
+
+        # Registrar (if a Hub registration is saved on this PC)
+        existing_reg = load_registration()
+        if existing_reg is not None and existing_reg.token and existing_reg.hub_address:
+            await self._start_registrar_async(existing_reg)
+
     async def _pump_capture(self) -> None:
         if self.capture is None or self.broadcaster is None:
             return
@@ -320,7 +347,157 @@ class HostApp(QObject):
         if self.server is None:
             return "RemoteControl - starting..."
         n = len(self.server.sessions)
-        return f"RemoteControl - PIN {self._pin} - {n} viewer{'' if n == 1 else 's'}"
+        text = f"RemoteControl - PIN {self._pin} - {n} viewer{'' if n == 1 else 's'}"
+        if self.hub_server is not None:
+            text += f"  |  Hub: {len(self.hub_server.active_registrations)} laptops online"
+        if self.registrar is not None:
+            text += f"  |  Hub registrar: {self.registrar.status}"
+        return text
+
+    # ---------- Hub admin (Qt-thread entry points) ----------
+
+    def _show_hub_settings(self) -> None:
+        if self._hub_dialog is not None and self._hub_dialog.isVisible():
+            self._hub_dialog.raise_()
+            self._hub_dialog.activateWindow()
+            return
+        cb = HubSettingsCallbacks(
+            list_registrations=self._hub_list_registrations,
+            list_active=self._hub_list_active,
+            add_registration=self._hub_add_registration,
+            remove_registration=self._hub_remove_registration,
+            set_hub_enabled=self._hub_set_enabled,
+            is_hub_running=lambda: self.hub_server is not None,
+            get_registration=lambda: load_registration(),
+            save_registration=self._hub_save_registration,
+            clear_registration=self._hub_clear_registration,
+            registrar_status=self._hub_registrar_status,
+        )
+        self._hub_dialog = HubSettingsDialog(cb, self.cfg.host)
+        self._hub_dialog.show()
+
+    def _hub_list_registrations(self) -> list:
+        return [self.hub_registry.get(n) for n in self.hub_registry.names() if self.hub_registry.get(n)]
+
+    def _hub_list_active(self) -> list[str]:
+        if self.hub_server is None:
+            return []
+        return [ar.name for ar in self.hub_server.active_registrations]
+
+    def _hub_add_registration(self, name: str):
+        return self.hub_registry.add(name)
+
+    def _hub_remove_registration(self, name: str) -> bool:
+        return self.hub_registry.remove(name)
+
+    def _hub_set_enabled(self, enabled: bool, port: int) -> None:
+        self.cfg.host.hub_enabled = bool(enabled)
+        self.cfg.host.hub_port = int(port)
+        try:
+            config.save(self.cfg)
+        except Exception:
+            logger.exception("config save failed")
+        if enabled:
+            fut = self.worker.run_coro(self._start_hub_server_async(port))
+            try:
+                fut.result(timeout=10)
+            except Exception as exc:
+                QMessageBox.warning(None, "Hub", f"Could not start Hub: {exc}")
+        else:
+            fut = self.worker.run_coro(self._stop_hub_server_async())
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                pass
+
+    def _hub_save_registration(self, hub_addr: str, hub_port: int, name: str, token: str) -> None:
+        existing = load_registration()
+        new_reg = HubRegistrationConfig(
+            hub_address=hub_addr,
+            hub_port=hub_port,
+            laptop_name=name,
+            token=token,
+            pinned_fingerprint=(existing.pinned_fingerprint if existing else ""),
+        )
+        # If hub_address or token changed, drop the pinned fingerprint
+        if existing is None or existing.hub_address != hub_addr or existing.hub_port != hub_port:
+            new_reg.pinned_fingerprint = ""
+        save_registration(new_reg)
+        # restart registrar
+        fut = self.worker.run_coro(self._start_registrar_async(new_reg, restart=True))
+        try:
+            fut.result(timeout=5)
+        except Exception:
+            pass
+
+    def _hub_clear_registration(self) -> None:
+        clear_registration()
+        fut = self.worker.run_coro(self._stop_registrar_async())
+        try:
+            fut.result(timeout=5)
+        except Exception:
+            pass
+
+    def _hub_registrar_status(self) -> tuple[str, str]:
+        if self.registrar is None:
+            return ("idle", "")
+        return (self.registrar.status, self.registrar.last_error)
+
+    # ---------- Hub orchestration (asyncio thread) ----------
+
+    async def _start_hub_server_async(self, port: int) -> None:
+        await self._stop_hub_server_async()
+        hub = HubServer(
+            registry=self.hub_registry,
+            port=port,
+            bind_address=self.cfg.host.hub_bind_address,
+        )
+        await hub.start()
+        self.hub_server = hub
+        self._hub_serve_task = asyncio.create_task(hub.serve_forever())
+        logger.info("Hub broker started on port %d", port)
+
+    async def _stop_hub_server_async(self) -> None:
+        if self._hub_serve_task is not None:
+            self._hub_serve_task.cancel()
+            try:
+                await self._hub_serve_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._hub_serve_task = None
+        if self.hub_server is not None:
+            await self.hub_server.stop()
+            self.hub_server = None
+            logger.info("Hub broker stopped")
+
+    async def _start_registrar_async(
+        self, reg: HubRegistrationConfig, restart: bool = False,
+    ) -> None:
+        if restart and self.registrar is not None:
+            await self.registrar.stop()
+            self.registrar = None
+        # Make sure the loopback listener is up so Hub-bridged streams have somewhere to land.
+        if self.server is not None and not self._loopback_started:
+            try:
+                await self.server.start_loopback(self.cfg.host.loopback_port)
+                self._loopback_started = True
+            except OSError as exc:
+                logger.warning("could not start loopback listener on %d: %s",
+                               self.cfg.host.loopback_port, exc)
+        target_port = self.cfg.host.loopback_port if self._loopback_started else self.cfg.host.port
+        self.registrar = HubRegistrar(
+            cfg=reg, local_host_port=target_port,
+            on_status_change=lambda s, e: logger.info("registrar: %s%s", s, f" ({e})" if e else ""),
+        )
+        self.registrar.start()
+        logger.info("registrar started for %s (target laptop name: %s)",
+                    f"{reg.hub_address}:{reg.hub_port}", reg.laptop_name)
+
+    async def _stop_registrar_async(self) -> None:
+        if self.registrar is not None:
+            await self.registrar.stop()
+            self.registrar = None
+            logger.info("registrar stopped")
 
     def quit(self) -> None:
         async def _shutdown() -> None:
@@ -328,6 +505,9 @@ class HostApp(QObject):
                 self._capture_task.cancel()
             if self.capture is not None:
                 await self.capture.stop()
+            if self.registrar is not None:
+                await self.registrar.stop()
+            await self._stop_hub_server_async()
             if self.server is not None:
                 await self.server.stop()
             if self.encoder is not None:

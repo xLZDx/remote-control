@@ -74,6 +74,7 @@ class HostServer:
         self._sessions: dict[str, ClientSession] = {}
         self._sessions_lock = asyncio.Lock()
         self._server: asyncio.base_events.Server | None = None
+        self._loopback_server: asyncio.base_events.Server | None = None
         self._ssl_ctx: ssl.SSLContext | None = None
 
     # ---------- public ----------
@@ -105,16 +106,48 @@ class HostServer:
         addrs = ", ".join(str(s.getsockname()) for s in self._server.sockets or [])
         logger.info("HostServer listening on %s", addrs)
 
+    async def start_loopback(self, loopback_port: int) -> int:
+        """
+        Start a PLAINTEXT TCP listener on 127.0.0.1 only. Used by the Hub
+        registration bridge so Hub-relayed clients can speak the host
+        protocol without an inner TLS wrap (v1 trade-off; the Hub is in
+        the trust path - see SECURITY.md).
+
+        Returns the bound port (useful when caller passed 0 for auto).
+        """
+        srv = await asyncio.start_server(
+            self._handle_client,
+            host="127.0.0.1",
+            port=loopback_port,
+        )
+        self._loopback_server = srv
+        addrs = ", ".join(str(s.getsockname()) for s in srv.sockets or [])
+        logger.info("HostServer loopback listener on %s", addrs)
+        return srv.sockets[0].getsockname()[1]
+
     async def serve_forever(self) -> None:
         if not self._server:
             raise RuntimeError("server not started")
-        async with self._server:
-            await self._server.serve_forever()
+        tasks = [asyncio.create_task(self._server.serve_forever())]
+        if self._loopback_server is not None:
+            tasks.append(asyncio.create_task(self._loopback_server.serve_forever()))
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            raise
 
     async def stop(self) -> None:
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+        for srv_attr in ("_server", "_loopback_server"):
+            srv = getattr(self, srv_attr)
+            if srv is not None:
+                srv.close()
+                try:
+                    await srv.wait_closed()
+                except Exception:
+                    pass
+                setattr(self, srv_attr, None)
         # close sessions
         for s in list(self._sessions.values()):
             await self._close_session(s)
