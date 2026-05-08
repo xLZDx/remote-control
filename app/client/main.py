@@ -71,6 +71,8 @@ class ClientApp(QObject):
     status_text = pyqtSignal(str)
     show_error = pyqtSignal(str)
     auto_disconnect = pyqtSignal()
+    # Cross-thread: emitted from asyncio worker, slot runs on Qt main thread
+    fingerprint_confirm_requested = pyqtSignal(str, str, object)  # host_key, fp, dict-result
 
     def __init__(self, qt: QApplication, cfg: config.AppConfig) -> None:
         super().__init__()
@@ -86,6 +88,7 @@ class ClientApp(QObject):
         # Wire signals
         self.show_error.connect(self._show_error)
         self.auto_disconnect.connect(self._on_auto_disconnect)
+        self.fingerprint_confirm_requested.connect(self._on_fingerprint_confirm_requested)
 
     def run(self) -> int:
         # 1. Connect dialog (loop on retryable failures)
@@ -179,16 +182,18 @@ class ClientApp(QObject):
         self.client.on_message = self._on_message  # noop until connected, but set early
 
         async def _confirm(host_key: str, fp: str) -> bool:
-            future: asyncio.Future = asyncio.get_event_loop().create_future()
-
-            def _ask() -> None:
-                accepted = FingerprintConfirmDialog(host_key, fp).exec()
-                future.get_loop().call_soon_threadsafe(
-                    future.set_result,
-                    accepted == FingerprintConfirmDialog.DialogCode.Accepted,
-                )
-            QTimer.singleShot(0, _ask)
-            return await future
+            # Cross-thread: we're on the asyncio worker thread, the Qt dialog
+            # must be opened on the Qt main thread. Use a pyqtSignal (auto-
+            # queued connection) + a threading.Event so this coroutine can
+            # await without blocking the asyncio loop.
+            logger.info("connect: sending fingerprint-confirm signal to UI thread")
+            ev = threading.Event()
+            result_box: dict = {"accepted": False}
+            self.fingerprint_confirm_requested.emit(host_key, fp, (ev, result_box))
+            await asyncio.get_event_loop().run_in_executor(None, ev.wait)
+            logger.info("connect: user %s the new fingerprint",
+                        "accepted" if result_box["accepted"] else "rejected")
+            return bool(result_box["accepted"])
 
         async def _connect_async() -> Any:
             return await asyncio.wait_for(
@@ -321,6 +326,21 @@ class ClientApp(QObject):
     @pyqtSlot(str)
     def _show_error(self, text: str) -> None:
         QMessageBox.critical(None, "RemoteControl", text)
+
+    @pyqtSlot(str, str, object)
+    def _on_fingerprint_confirm_requested(self, host_key: str, fp: str, payload: object) -> None:
+        """Open the cert-confirm dialog on the Qt main thread, then signal the
+        asyncio worker thread by setting the threading.Event in `payload`."""
+        ev, result_box = payload  # type: ignore[misc]
+        try:
+            dlg = FingerprintConfirmDialog(host_key, fp)
+            accepted = dlg.exec() == FingerprintConfirmDialog.DialogCode.Accepted
+            result_box["accepted"] = accepted
+        except Exception:
+            logger.exception("fingerprint dialog raised")
+            result_box["accepted"] = False
+        finally:
+            ev.set()
 
     def _teardown(self) -> None:
         try:
