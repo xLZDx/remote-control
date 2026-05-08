@@ -196,10 +196,10 @@ class ClientApp(QObject):
             return bool(result_box["accepted"])
 
         async def _connect_async() -> Any:
-            return await asyncio.wait_for(
-                self.client.connect(pin=inputs.pin, confirm_new_fingerprint=_confirm),
-                timeout=config.CLIENT_OVERALL_CONNECT_TIMEOUT_S,
-            )
+            # No outer wait_for: the cert-confirm dialog can take arbitrary
+            # time on first connect, and per-step timeouts inside connect()
+            # (TCP open, each handshake message) already bound the rest.
+            return await self.client.connect(pin=inputs.pin, confirm_new_fingerprint=_confirm)
 
         target_label = (
             f"hub:{inputs.hub_address}:{inputs.hub_port} -> {inputs.laptop_name}"
@@ -209,6 +209,7 @@ class ClientApp(QObject):
         logger.info("connect attempt: %s", target_label)
         try:
             fut = self.worker.run_coro(_connect_async())
+            # Generous outer cap (10 min) to cover slow user on cert dialog.
             fut.result(timeout=config.CLIENT_OVERALL_CONNECT_TIMEOUT_S + 5)
             logger.info("connect success: %s", target_label)
             return True
