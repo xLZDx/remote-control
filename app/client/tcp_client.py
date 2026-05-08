@@ -123,18 +123,25 @@ class HostClient:
         SECURITY.md).
         """
         if self.via_hub is not None:
+            logger.info("connect: opening via Hub %s:%d -> %s",
+                        self.via_hub.hub_address, self.via_hub.hub_port, self.via_hub.laptop_name)
             await self._open_via_hub(confirm_new_fingerprint)
         else:
+            logger.info("connect: opening direct TCP/TLS to %s:%d", self.address, self.port)
             await self._open_direct(confirm_new_fingerprint)
+        logger.info("connect: TCP/TLS+fingerprint OK; sending HELLO")
 
         # ---- application handshake (same code path for both transports) ----
         await self.send(protocol.hello(self.client_name))
+        logger.info("connect: HELLO sent; waiting for HELLO_ACK")
 
         msg = await asyncio.wait_for(protocol.read_message(self.reader), config.HANDSHAKE_TIMEOUT_S)
         if msg.type is not MessageType.HELLO_ACK:
             await self.close()
             raise AuthError(f"expected HELLO_ACK, got {msg.type.name}")
         hello_ack = msg.as_json()
+        logger.info("connect: got HELLO_ACK from host '%s'; waiting for AUTH_CHALLENGE",
+                    hello_ack.get("host_name", "?"))
 
         msg = await asyncio.wait_for(protocol.read_message(self.reader), config.HANDSHAKE_TIMEOUT_S)
         if msg.type is not MessageType.AUTH_CHALLENGE:
@@ -145,6 +152,7 @@ class HostClient:
         nonce = bytes.fromhex(chal["nonce"])
         proof = crypto.compute_proof(pin, salt, nonce)
         await self.send(protocol.auth_response(proof.hex()))
+        logger.info("connect: AUTH_RESPONSE sent; waiting for AUTH_OK")
 
         msg = await asyncio.wait_for(protocol.read_message(self.reader), config.HANDSHAKE_TIMEOUT_S)
         if msg.type is MessageType.AUTH_FAIL:
@@ -230,6 +238,7 @@ class HostClient:
             ) from exc
         except (ConnectionError, OSError, ssl.SSLError) as exc:
             raise ConnectionError(f"connect to {self.address}:{self.port} failed: {exc}") from exc
+        logger.info("connect: TCP+TLS established to %s:%d; verifying cert", self.address, self.port)
         host_key = f"{self.address}:{self.port}"
         await self._verify_fingerprint(host_key, confirm_new_fingerprint)
 
@@ -298,7 +307,10 @@ class HostClient:
             if existing != fp:
                 await self.close()
                 raise FingerprintMismatchError(existing, fp)
+            logger.info("connect: cert fingerprint matches pinned for %s", host_key)
         else:
+            logger.info("connect: NEW fingerprint for %s (%s); awaiting user confirmation",
+                        host_key, fp[:23] + "...")
             ok = True
             if confirm_new_fingerprint is not None:
                 ok = await confirm_new_fingerprint(host_key, fp)
@@ -307,5 +319,6 @@ class HostClient:
                 raise AuthError("user rejected new fingerprint")
             pins[host_key] = fp
             save_pins(pins)
+            logger.info("connect: user accepted new fingerprint for %s", host_key)
         # Stash for HostInfo if direct mode; via-Hub will overwrite later.
         self._opened_fingerprint = fp
