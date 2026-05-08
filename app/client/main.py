@@ -13,7 +13,7 @@ import sys
 import threading
 from typing import Any
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEventLoop, QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app.client.connect_dialog import ConnectDialog, ConnectInputs, FingerprintConfirmDialog
@@ -209,8 +209,18 @@ class ClientApp(QObject):
         logger.info("connect attempt: %s", target_label)
         try:
             fut = self.worker.run_coro(_connect_async())
-            # Generous outer cap (10 min) to cover slow user on cert dialog.
-            fut.result(timeout=config.CLIENT_OVERALL_CONNECT_TIMEOUT_S + 5)
+            # Pump the Qt event loop while waiting so the cert-confirm dialog
+            # (emitted via pyqtSignal from the asyncio thread) can actually be
+            # delivered and rendered. Blocking on fut.result() here would
+            # freeze the event loop and the dialog would never open.
+            import time
+            deadline = time.monotonic() + config.CLIENT_OVERALL_CONNECT_TIMEOUT_S + 5
+            while not fut.done() and time.monotonic() < deadline:
+                self.qt.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
+            if not fut.done():
+                fut.cancel()
+                raise asyncio.TimeoutError()
+            fut.result()  # re-raise underlying exception if any
             logger.info("connect success: %s", target_label)
             return True
         except asyncio.TimeoutError:
