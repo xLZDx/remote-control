@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from app.client.tcp_client import HostClient
 
-HOST = "192.168.0.167"
+HOST = "188.244.21.9"
 PORT = 7777
 PIN = "385649"
 
